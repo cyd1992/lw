@@ -20,6 +20,109 @@
 -------------------
 
 
+#2 相关理论
+##2.1 TS流格式
+-----------------
+
+TS流是MPEG-2标准中定义一种用于直播的码流结构，具有很好的容错能力。ts流最早应用于数字电视领域，其格式非常复杂包含的配置信息表多大十几个，视频格式主要是mpeg2。苹果公司发明的http live stream流媒体是基于ts文件的，不过他大大简化了传统的ts流，只需要2个最基本的配置表PAT和PMT，再加上音视频内容就可以了，hls流媒体视频编码的主要格式为h264/mpeg4，音频为aac/mp3。
+ts文件分为三层：ts层（Transport Stream）、pes层（Packet Elemental Stream）、es层（Elementary Stream）。es层就是音视频数据，pes层是在音视频数据上加了时间戳等对数据帧的说明信息，ts层是在pes层上加入了数据流识别和传输的必要信息。
+
+
+ts包大小固定为188字节，ts层分为三个部分：ts header、adaptation field、payload。ts header固定4个字节；adaptation field可能存在也可能不存在，主要作用是给不足188字节的数据做填充；payload是pes数据。
+
+ts header
+
+![tsheader](src/tsheader.png)
+
+ts层的内容是通过PID值来标识的，主要内容包括：PAT表、PMT表、音频流、视频流。解析ts流要先找到PAT表，只要找到PAT就可以找到PMT，然后就可以找到音视频流了。PAT表的PID值固定为0。PAT表和PMT表需要定期插入ts流，因为用户随时可能加入ts流，这个间隔比较小，通常每隔几个视频帧就要加入PAT和PMT。PAT和PMT表是必须的，还可以加入其它表如SDT（业务描述表）等，不过hls流只要有PAT和PMT就可以播放了。
+
+* PAT表：他主要的作用就是指明了PMT表的PID值。
+* PMT表：他主要的作用就是指明了音视频流的PID值。
+* 音频流/视频流：承载音视频内容。
+
+adaption
+
+![adapter](src/adapter.png)
+
+自适应区的长度要包含传输错误指示符标识的一个字节。pcr是节目时钟参考，pcr、dts、pts都是对同一个系统时钟的采样值，pcr是递增的，因此可以将其设置为dts值，音频数据不需要pcr。如果没有字段，ipad是可以播放的，但vlc无法播放。打包ts流时PAT和PMT表是没有adaptation field的，不够的长度直接补0xff即可。视频流和音频流都需要加adaptation field，通常加在一个帧的第一个ts包和最后一个ts包里，中间的ts包不加。
+
+PAT
+
+![PAT](src/PAT.png)
+
+PMT
+
+![PMT](src/PMT.png)
+
+PES
+
+![PES](src/PES.png)
+
+pts是显示时间戳、dts是解码时间戳，视频数据两种时间戳都需要，音频数据的pts和dts相同，所以只需要pts。有pts和dts两种时间戳是B帧引起的，I帧和P帧的pts等于dts。如果一个视频没有B帧，则pts永远和dts相同。从文件中顺序读取视频帧，取出的帧顺序和dts顺序相同。dts算法比较简单，初始值 + 增量即可，pts计算比较复杂，需要在dts的基础上加偏移量。
+音频的pes中只有pts（同dts），视频的I、P帧两种时间戳都要有，视频B帧只要pts（同dts）。打包pts和dts就需要知道视频帧类型，但是通过容器格式我们是无法判断帧类型的，必须解析h.264内容才可以获取帧类型。
+
+点播视频dts算法：
+dts = 初始值 + 90000 / video_frame_rate，初始值可以随便指定，但是最好不要取0，video_frame_rate就是帧率，比如23、30。
+pts和dts是以timescale为单位的，1s = 90000 time scale , 一帧就应该是90000/video_frame_rate 个timescale。
+用一帧的timescale除以采样频率就可以转换为一帧的播放时长
+
+点播音频dts算法：
+dts = 初始值 + (90000 * audio_samples_per_frame) / audio_sample_rate，audio_samples_per_frame这个值与编解码相关，aac取值1024，mp3取值1158，audio_sample_rate是采样率，比如24000、41000。AAC一帧解码出来是每声道1024个sample，也就是说一帧的时长为1024/sample_rate秒。所以每一帧时间戳依次0，1024/sample_rate，...，1024*n/sample_rate秒。
+
+直播视频的dts和pts应该直接用直播数据流中的时间，不应该按公式计算。
+
+
+##2.2 RTMP协议
+--------------------
+RTMP协议是Real Time Message Protocol(实时信息传输协议)的缩写，它是由Adobe公司提出的一种应用层的协议，用来解决多媒体数据传输流的多路复用（Multiplexing）和分包（packetizing）的问题。随着VR技术的发展，视频直播等领域逐渐活跃起来，RTMP作为业内广泛使用的协议也重新被相关开发者重视起来。
+
+RTMP协议是应用层协议，是要靠底层可靠的传输层协议（通常是TCP）来保证信息传输的可靠性的。在基于传输层协议的链接建立完成后，RTMP协议也要客户端和服务器通过“握手”来建立基于传输层链接之上的RTMP Connection链接，在Connection链接上会传输一些控制信息，如SetChunkSize,SetACKWindowSize。其中CreateStream命令会创建一个Stream链接，用于传输具体的音视频数据和控制这些信息传输的命令信息。RTMP协议传输时会对数据做自己的格式化，这种格式的消息我们称之为RTMP Message，而实际传输的时候为了更好地实现多路复用、分包和信息的公平性，发送端会把Message划分为带有Message ID的Chunk，每个Chunk可能是一个单独的Message，也可能是Message的一部分，在接受端会根据chunk中包含的data的长度，message id和message的长度把chunk还原成完整的Message，从而实现信息的收发。
+要建立一个有效的RTMP Connection链接，首先要“握手”:客户端要向服务器发送C0,C1,C2（按序）三个chunk，服务器向客户端发送S0,S1,S2（按序）三个chunk，然后才能进行有效的信息传输。RTMP协议本身并没有规定这6个Message的具体传输顺序，但RTMP协议的实现者需要保证这几点：
+
+* 客户端要等收到S1之后才能发送C2
+* 客户端要等收到S2之后才能发送其他信息（控制信息和真实音视频等数据）
+* 服务端要等到收到C0之后发送S1
+* 服务端必须等到收到C1之后才能发送S2
+* 服务端必须等到收到C2之后才能发送其他信息（控制信息和真实音视频等数据） 
+* 如果每次发送一个握手chunk的话握手顺序会是这样：
+
+![handshake](src/RTMP-handshake.png =x600)
+
+Chunk Stream是对传输RTMP Chunk的流的逻辑上的抽象，客户端和服务器之间有关RTMP的信息都在这个流上通信。这个流上的操作也是我们关注RTMP协议的重点。
+
+3.1 Message(消息)
+
+这里的Message是指满足该协议格式的、可以切分成Chunk发送的消息，消息包含的字段如下：
+
+Timestamp（时间戳）：消息的时间戳（但不一定是当前时间，后面会介绍），4个字节
+Length(长度)：是指Message Payload（消息负载）即音视频等信息的数据的长度，3个字节
+TypeId(类型Id)：消息的类型Id，1个字节
+Message Stream ID（消息的流ID）：每个消息的唯一标识，划分成Chunk和还原Chunk为Message的时候都是根据这个ID来辨识是否是同一个消息的Chunk的，4个字节，并且以小端格式存储
+
+3.2 Chunking(Message分块)
+RTMP在收发数据的时候并不是以Message为单位的，而是把Message拆分成Chunk发送，而且必须在一个Chunk发送完成之后才能开始发送下一个Chunk。每个Chunk中带有MessageID代表属于哪个Message，接受端也会按照这个id来将chunk组装成Message。 
+为什么RTMP要将Message拆分成不同的Chunk呢？通过拆分，数据量较大的Message可以被拆分成较小的“Message”，这样就可以避免优先级低的消息持续发送阻塞优先级高的数据，比如在视频的传输过程中，会包括视频帧，音频帧和RTMP控制信息，如果持续发送音频数据或者控制数据的话可能就会造成视频帧的阻塞，然后就会造成看视频时最烦人的卡顿现象。同时对于数据量较小的Message，可以通过对Chunk Header的字段来压缩信息，从而减少信息的传输量。（具体的压缩方式会在后面介绍） 
+Chunk的默认大小是128字节，在传输过程中，通过一个叫做Set Chunk Size的控制信息可以设置Chunk数据量的最大值，在发送端和接受端会各自维护一个Chunk Size，可以分别设置这个值来改变自己这一方发送的Chunk的最大大小。大一点的Chunk减少了计算每个chunk的时间从而减少了CPU的占用率，但是它会占用更多的时间在发送上，尤其是在低带宽的网络情况下，很可能会阻塞后面更重要信息的传输。小一点的Chunk可以减少这种阻塞问题，但小的Chunk会引入过多额外的信息（Chunk中的Header），少量多次的传输也可能会造成发送的间断导致不能充分利用高带宽的优势，因此并不适合在高比特率的流中传输。在实际发送时应对要发送的数据用不同的Chunk Size去尝试，通过抓包分析等手段得出合适的Chunk大小，并且在传输过程中可以根据当前的带宽信息和实际信息的大小动态调整Chunk的大小，从而尽量提高CPU的利用率并减少信息的阻塞机率。
+
+ 
+
+
+##2.3 HLS协议
+--------------------
+
+HTTP Live Streaming（缩写是HLS）是一个由苹果公司提出的基于HTTP的流媒体网络传输协议。是苹果公司QuickTime和iPhone软件系统的一部分。它的工作原理是把整个流分成一个个小的基于HTTP的文件来下载，每次只下载一些。当媒体流正在播放时，客户端可以选择从许多不同的备用源中以不同的速率下载同样的资源，允许流媒体会话适应不同的数据速率。在开始一个流媒体会话时，客户端会下载一个包含元数据的extended M3U (m3u8)playlist文件，用于寻找可用的媒体流。
+HLS只请求基本的HTTP报文，与实时传输协议（RTP)不同，HLS可以穿过任何允许HTTP数据通过的防火墙或者代理服务器。它也很容易使用内容分发网络来传输媒体流。
+苹果公司把HLS协议作为一个互联网草案（逐步提交），在第一阶段中已作为一个非正式的标准提交到IETF。但是，即使苹果偶尔地提交一些小的更新，IETF却没有关于制定此标准的有关进一步的动作。
+
+HLS协议规定：
+
+视频的封装格式是TS。
+视频的编码格式为H264,音频编码格式为MP3、AAC或者AC-3。
+除了TS视频文件本身，还定义了用来控制播放的m3u8文件（文本文件）。
+HLS主要是为了解决RTMP协议存在的一些问题。比如RTMP协议不使用标准的HTTP接口传输数据，所以在一些特殊的网络环境下可能被防火墙屏蔽掉。但是HLS由于使用的HTTP协议传输数据，不会遇到被防火墙屏蔽的情况（该不会有防火墙连80接口都不放过吧）。
+另外于负载，RTMP是一种有状态协议，很难对视频服务器进行平滑扩展，因为需要为每一个播放视频流的客户端维护状态。而HLS基于无状态协议（HTTP），客户端只是按照顺序使用下载存储在服务器的普通TS文件，做负责均衡如同普通的HTTP文件服务器的负载均衡一样简单。
+另外HLS协议本身实现了码率自适应，不同带宽的设备可以自动切换到最适合自己码率的视频播放。其实HLS最大的优势就是他的亲爹是苹果。苹果在自家的IOS设备上只提供对HLS的原生支持，并且放弃了flash。Android也迫于平果的“淫威”原生支持了HLS。这样一来flv，rtmp这些Adobe的视频方案要想在移动设备上播放需要额外下点功夫。当然flash对移动设备造成很大的性能压力确实也是自身的问题。
+
 
 
 #2 整体方案设计
@@ -283,6 +386,16 @@ edit() : void <br>
 
 当要启动或停止录制回看视频时，管理员发送send()消息给类TSTable，类TSTable通过当前显示状态判断是进行启动还是停止操作，接着，类TSTable发送start或者stop命令给管理服务器，最后管理服务器发送start或者stop命令给远程的回看录制服务器。最后回看录制服务器返回程序执行的结果，并显示在用户界面上。
 
+### 3.1.6 播放接口设计
+------------------------------------
+除了管理回看节目的管理与启动之外，本软件还要负责提供一套供客户端播放器进行播放的数据接口。接口定义如下：
+
+        function get_channels()
+        function get_videos(string channel_id,int day)
+        
+其中，函数get_channels返回当前所有可用的频道信息。函数get_videos则返回指定天数的回看视频信息。客户端获取数据时使用该数据接口调用顺序如下：首先，调用get_channels函数，该函数将返回所有数据库中active项等于1的直播信息，接着，客户端遍历所有的直播频道，在每个直播频道中使用get_video函数获取最近7天的回看节目信息，返回的数据中，如果字段finished为1，则显示在界面上待用户点击观看。
+        
+
 
 
 ## 3.2 EPG同步服务器的设计与实现
@@ -297,11 +410,16 @@ EPG为IPTV提供的基本业务(如VOD点播/KTV/歌曲)及各种增值业务的
 
 
 
-### 3.2.2 EPG同步服务器系统设计
+### 3.2.2 EPG同步服务器系统接口设计
 ----------------------------
 EPG同步服务器主要实时同步100套电视直播节目的EPG信息，并对外提供相应的数据接口。EPG同步服务器的系统框图如图所示：
 
-首先，服务器每隔一段时间，便从第三方数据源处获取实时的EPG更新数据。
+首先，服务器每隔一段时间，便从第三方数据源处获取实时的EPG更新数据。EPG同步服务器提供的数据接口如下：
+
+		function
+		function
+
+		
 
 
 
@@ -351,23 +469,12 @@ FMS(AMS)的集群还是很不错的，虽然在运营容错很差。SRS（Simple
 
 1 rtmp<br>
 
-RTMP(Real Time Messaging Protoc01)协议 是传输层协议,是基于TCP的协议。创建的是长 连接。它像一个用来装数据包的容器,这些数据可以是AMF格式的数据,也可以是FI。V中的视/音 频数据。在RTMP中控制信息和媒体数据都称之 为message。由于PTMP是基于TCP的,并且 message的长度会很长,所以RTMP采用了一种 分片的策略。每一个分片称为chunk。每个message被分解成一个或多个chunk。
+
 
 
 2 HLS<br>
 
-HTTP Live Streaming（缩写是HLS）是一个由苹果公司提出的基于HTTP的流媒体网络传输协议。是苹果公司QuickTime和iPhone软件系统的一部分。它的工作原理是把整个流分成一个个小的基于HTTP的文件来下载，每次只下载一些。当媒体流正在播放时，客户端可以选择从许多不同的备用源中以不同的速率下载同样的资源，允许流媒体会话适应不同的数据速率。在开始一个流媒体会话时，客户端会下载一个包含元数据的extended M3U (m3u8)playlist文件，用于寻找可用的媒体流。
-HLS只请求基本的HTTP报文，与实时传输协议（RTP)不同，HLS可以穿过任何允许HTTP数据通过的防火墙或者代理服务器。它也很容易使用内容分发网络来传输媒体流。
-苹果公司把HLS协议作为一个互联网草案（逐步提交），在第一阶段中已作为一个非正式的标准提交到IETF。但是，即使苹果偶尔地提交一些小的更新，IETF却没有关于制定此标准的有关进一步的动作。
 
-HLS协议规定：
-
-视频的封装格式是TS。
-视频的编码格式为H264,音频编码格式为MP3、AAC或者AC-3。
-除了TS视频文件本身，还定义了用来控制播放的m3u8文件（文本文件）。
-HLS主要是为了解决RTMP协议存在的一些问题。比如RTMP协议不使用标准的HTTP接口传输数据，所以在一些特殊的网络环境下可能被防火墙屏蔽掉。但是HLS由于使用的HTTP协议传输数据，不会遇到被防火墙屏蔽的情况（该不会有防火墙连80接口都不放过吧）。
-另外于负载，RTMP是一种有状态协议，很难对视频服务器进行平滑扩展，因为需要为每一个播放视频流的客户端维护状态。而HLS基于无状态协议（HTTP），客户端只是按照顺序使用下载存储在服务器的普通TS文件，做负责均衡如同普通的HTTP文件服务器的负载均衡一样简单。
-另外HLS协议本身实现了码率自适应，不同带宽的设备可以自动切换到最适合自己码率的视频播放。其实HLS最大的优势就是他的亲爹是苹果。苹果在自家的IOS设备上只提供对HLS的原生支持，并且放弃了flash。Android也迫于平果的“淫威”原生支持了HLS。这样一来flv，rtmp这些Adobe的视频方案要想在移动设备上播放需要额外下点功夫。当然flash对移动设备造成很大的性能压力确实也是自身的问题。
 
 
 
@@ -434,39 +541,393 @@ SRS启动之后，只需要将直播流以RTMP的形式推送到服务器上，�
 ### 3.3.2 回看服务器的程序实现
 ---------------------------
 回来看服务器中的录制程序使用Python3.5进行编写，服务器选用flask框架用于与管理服务器进行通信。程序模块图如图所示：
+录制程序共分为http服务器模块，数据库模块，EPG更新模块，日志模块以及主录制模块
+
+1. 服务器模块
+服务器模块主要负责创建http服务器与管理服务器通信。接收管理服务器发送来的录制信息并返回录制程序的状态。
+服务器模块的主要方法如下。
+
+        def status() 
+        def start() 
+        def kill() 
+
+当管理服务器请求录制程序状态时，statu方法返回指定节目的录制状态，如“运行中”，“已停止”，“发生错误”等等。
+当管理服务器发来开始录制请求时，该方法根据所请求的参数分别调用start和kill方法启动和停止节目的录制。
 
 
 
 
+2. 数据库模块
+数据库模块主要负责数据库相关操作。服务器模块包含的主要方法如下：
+
+        def get_udp_port(channel_id)
+        def set_start(channel_id,active)
+        def get_available_program(channel_id,START_TIME)
+        def delete_program(channel_id):
+		def insert_program(event_id, channel_id, st, et, title)
+		def delete_expire_program(channel_id,expire=8)
+		
+函数get_live_url主要负责根据输入的channel_id参数获取udp流端口信息信息。如果获取成功，则可以监听本机的该udp端口获取到待录制的视频流。函数set_start函数负责设置指定channel_id的录制状态，其中0代表未运行，1代表运行中，2代表已运行。函数get_available_program函数负责获取当前可用的epg信息用于生成相应的m3u8文件。函数delete_program负责删除指定频道未录制的epg信息以便更新最新的epg信息。函数insert_program负责添加指定channel_id的epg信息。函数delete_expire_program用来删除陈旧的epg信息，默认的过期时间为8天。
+
+3. EPG更新模块
+EPG更新模块主要负责定时更新epg信息。因为电视节目是处于不断变化之中的，所以存储在数据库之中的epg也需要不断的更新。epg模块的主要函数update伪代码如下所示:
+
+		def update(channel_id):
+    		try:
+        		tree = et.parse(ur.urlopen(EPG_URL + channel_id))
+    		except:
+        		return
+
+    		if tree == None:
+        		return
+
+    		dbutil.delete_program(channel_id)  #删除未录制的视频
+
+			# 解析epg信息
+    		root = tree.getroot()
+    		now = datetime.now()
+    		for schedule in root.iter('schedule'):
+        		parseEPG()
+				# 如果该epg信息的结束时间大于系统当前时间，则将该条epg信息添加到数据库。
+            	if end_dt > now :
+                	dbutil.insert_program(event_id,channel_id,start_dt,end_dt,title)
+
+首先，函数update根据输入的channel_id参数像epg服务器中请求对应的epg信息。如果获取失败则返回。接着删除数据库中未录制的epg信息。最后解析获取到的新的epg信息，遍历所有epg信息，如果该epg信息的结束时间大于系统当前时间，则将该条epg信息添加到数据库。
+
+4. 日志模块
+日志模块提供了通用的日志系统。底层调用python的logging模块，该模块提供不同的日志级别，还可以方便的调整日志文件输出的内容。日志模块进一步的对logging模块进行封装。根据程序的需求建立不同的日志文件，方便随时观察程序运行情况，观察可能出现的问题。日志模块包含的xxx函数伪代码如下所示：
+         
+        def getLogger(filename,name=None):
+            if name == None:
+    		    logger = logging.getLogger()
+    		else:
+        		logger = logging.getLogger(name)
+
+    		formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    		fh = logging.FileHandler(filename)
+
+    		fh.setLevel(logging.DEBUG)  #设置日志显示级别
+    		fh.setFormatter(formatter)  #设置日志显示格式
+    		logger.addHandler(fh)       #设置日志文件
+
+    		return logger
+该函数根据输入的日志文件名初始化一个日志对象。在初始化的过程中分别设置好日志的级别以及日志的显示格式并返回该日志对象。在程序中只需要调用logger的debug函数即可将调试信息打印到日志文件之中。调试过程中将日志设为DEBUG级别，logging模块将输出所有步骤的运行信息，以便开发过程中判断出现问题的步骤。当程序调试完成后，将日志设为INFO级，则DEBUG日志内容不再保存，只留下日常所需的日志信息。
+       
+
+5. 主录制模块
+主录制模块负责程序的最核心部分：将udp流进行切片，生成一个个ts文件，并根据数据库中的EPG信息生成可供回看的m3u8文件。主录制模块核心函数main()伪代码如下所示：
+  
+        def Dump2(channel_id)：
+    		port = dbutil.get_udp_port(channel_id)
+
+		    if port == None:
+        		error_map[channel_id] = "wrong stream"
+        		dbutil.set_start(channel_id, False)
+        		return
+
+    			channel_path = html_path + channel_id
+
+    		if not os.path.exists(channel_path + '/'):
+        		os.makedirs(channel_path +'/')
+
+    		try:
+        		while True：
+
+            		res = dump(port, channel_path.encode(), 60)
+            
+            		if res != 0:
+                		error_map[channel_id] = "no stream"
+            	
+            		time.sleep(60 * 5)
+    		finally:
+        		dbutil.set_start(channel_id, False)
 
 
+            
+            
+首先，函数根据传入进来的channel_id参数，从数据库中获取对应的client_ip字段，从client_ip字段中解析出对应的udp端口，接着，程序进入无限循环中，调用dump()函数将udp流录制为长度为一分钟的ts文件。当出现错误（流断开或者网络异常）时，dump函数返回，更改当前录制状态，延时五分钟之后，继续执行dump函数。由于python的性能限制，并不能用来处理节目的录制，所以dump函数使用速度较快的c语言完成，dump函数的声明如下所示：
+       
+       int dump(int iPort, char* channel_path, int duration);
+      
+该函数被调用时，启动一个线程监听iPort端口，接受iPort端口传送来的数据并把他切片成ts文件。生成的文件存放在程序创建的channel_path文件夹下当前日期的子文件夹下，如果文件夹不存在则创建一个新的文件夹。duration为ts文件的视频时间。当iPort端口没有数据超过一分钟，该函数返回-1。
+
+       
+            
 
 
 
 # 4 客户端播放器的设计与实现
 
 ## 4.1 概述
-----------
+-----------
+
+为了用户能够观看流媒体服务器上的流媒体视频节目，需要设计实现跨平台的视频播放器客户端，使用户能够在不同的终端平台上（如pc、手机，电视机顶盒）都能够流畅的观看电视直播与回看节目。系统需求如下：
+
+
+1. 支持跨平台播放，用户能够在pc、手机浏览器、手机客户端、电视机顶盒等客户端之中自由选择。
+2. 支持选择与流畅播放指定直播节目。
+3. 支持显示与流畅播放指定节目最近7天的回看节目。
+4. 支持回看节目的快进与快退。
+
+关系图如图所示：
+客户端播放器共分为pc网页播放器、手机浏览器播放器，安卓手机客户端播放器以及安卓机顶盒客户端播放器。
+
+
+
 
 ## 4.2 网页播放器
-----------------
-
-
-## 4.3 手机浏览器播放器
+---------------
+### 4.2.1 整体结构实现
 --------------------
-## 4.4 安卓手机客户端播放器
+为了使用户在pc上和手机上都能有良好的播放体验。网页播放器分别设计两款ui界面供用户观看，pc网页播放器效果图如图所示，手机网页播放器效果图如图所示。
+
+
+
+
+网页播放器使用HTML+CSS+JAVASCRIPT语言实现。视频播放框架使用开源的videojs框架以及扩展的videojs-hls扩展插件。videojs是一个几乎兼容市面上所有浏览器的HTML5播放器插件。可以使用CSS轻松定制皮肤.在不支持HTML5的浏览器上自动切换成flash进行播放。支持h.264，flv等主流视频格式，极大地提高了浏览器对视频播放的兼容性。
+
+### 4.2.2 功能模块实现
+--------------------
+1. 视频播放模块
+视频播放模块负责控制视频的播放，获取网络流信息到本地，解码后进行播放。videojs的初始化与播放函数如下所示：
+
+		function InitPlayer()
+		{
+ 			playerInstance = videojs('myElement',{ "height": video_height, "width": video_width });
+		}
+		
+		function Play(url)
+		{
+  			playerInstance.src({
+      			src: rtmp2hls(url),
+      			type: 'application/x-mpegURL',
+      		withCredentials: false
+    		});
+
+  			playerInstance.load();
+		}
+		
+在系统初始化加载过程中，调用InitPlyaer函数完成对指定控件的初始化操作。在初始化的过程中制定好播放控件的宽和高。在需要播放视频的时候调用Play函数进行播放即可。
+
+
+2. 节目信息获取模块
+节目信息的获取使用JavaScript开源库zeptojs。Zepto是专门为现代智能手机浏览器退出的 Javascript 框架, 拥有和jQuery相似的语法,大小却比jQuery小很多。使用zeptojs相关的ajax函数，可以在不跳转页面的条件下轻松的完成数据获取操作。AJAX即“Asynchronous Javascript And XML”，是指一种创建交互式网页应用的网页开发技术。通过在后台与服务器进行少量数据交换，AJAX可以使网页实现异步更新。这意味着可以在不加载整个网页的情况下对网页的某分进行更新。传统的网页如果需要更新内容，必须重载整个网页页面。使用zepto的getJSON函数获取直播信息过程如下：
+
+		$.getJSON(CHANNEL_URL, function(data){
+       
+        	$("#channel-list").remove();
+
+       		$.each(data.category, function(index, item){  
+
+       			$("#channel-list").append(channel);
+
+           		channel.on('click',function(){
+
+            		UpdateChannel(item.channel_id,item.channel_name,item.rtmp_url);
+
+          		});
+            
+        	});
+
+	    });
+
+首先，程序访问管理服务器的直播频道信息接口。将获取下来的频道信息依次添加到界面上的channel-list列表上，然后在每一条频道信息上添加点击监听。当用户点击每个频道是，调用UpdateChannel函数，程序会访问管理服务器的回看节目信息接口，将最近7天的回看信息下载下来并存储在对应的列表之中。
+
+
+
+
+## 4.4 安卓手机与机顶盒播放器
 ------------------------
+### 4.4.1 安卓系统组件
+-------------------
+Android 是基于 Linux 的开源手机操作系统，其系统采用了软件堆层(software stack，又名软件叠层)的架构。底层 Linux 内核仅提供基本功能，其他系统中的应用软件则开发者或厂商自行开发，其中部分代码以 Java 编写。如图 2.1 所示，Android 系统的架构由底层到应用层主要由 4 个层次 5 个部分组成，分别为 Linux 内核层(Linux Kernel)、系统类库(Libraries)和运行库层(Android Runtime)、应用程序框架层(Application Frameworks)
+和应用程序层(Applications)。Android四大基本组件分别是Activity，Service服务,Content Provider内容提供者，BroadcastReceiver广播接收器。
 
-## 4.5 安卓机顶盒播放器
+1. Android 系统中最常用、使用最频繁的基本组件就是 Activity 组件，在一个 Android应用中，一个Activity 表示一个可视化的界面，也就相当于是一个单独的屏幕。不同的Activity 被系统视为不同的类，这些不同类的父类都继承自 Activity 这个基类。这个Activity 类就会显现出由多个 Views 控件组成的用户自定义的接口，并且针对该接口的事件作出对应的响应。因为一个程序对应多个用户定义的 Activity，所以多数的应用程序都会包含多于一个的 Activity。例如，联系人列表是一个 Activity，查看联系人详细信息是里另一个 Activity，给其中一个联系人发短信息又是另外一个 Activity。尽管一个整体的用户界面是由多个 Activity 组成，但是每个 Activity 都是独立于其他的 Activity 而存在的。
+2. Service通常情况下 Service 是一个没有可视化用户界面但拥有长生命周期的应用程序，这个程序不需要与用户进行交互，它是无时间限制运行在系统的后台任务，与 Unix 进行相类似。每个服务都继承于 Service 基类，通常是执行一些需要持续运行的情况。它负责触发通知和某些可视的 Activity 和数据源。它可以绑定其他正在持续运行的服务，若该服务没有运行，则启动该服务。连接后，它可以通过那个服务的接口与服务进行通讯。Service 服务在应用程序中的主线程内运行，它和 Activity 组件等运行情况相同，所以Service 会派生新的线程来进行耗时任务，这些任务不会对其它应用界面和组件产生任何阻塞或干扰。
+3. Broadcast Receiver 和 Service 一样，不会显示有 UI 元素的图形界面，它是为了实
+现广播而提供的一种组件，广播来自系统或应用程序，它负责接收广播并做出相应的动
+作亦接收请求并处理 Intent 。通常 Service 和 Broadcast Receiver 都会在
+AndroidManifest.xml 文件中注册。
+4. Content Provider 组件主要用于 Android 应用程序的数据存储管理，为了能够在应用
+程序间共享数据。一般情况它起到扮演服务器的角色，通过它可以对数据存储进行访问。
+通过 Content Provider 中的读写功能来传递对数据进行存储和更新等操作，但是应用程
+序是调用一个 Content Resolver 对象的方法来实现访问数据的。Content Resolver 与
+Content Provider 相对应，每一个 Content Resolver 能够与任何一个 Content Provider 通信
+
+### 4.4.1 整体结构实现
 --------------------
+为了使终端用户可以随时随地的观看视频节目，安卓手机客户端播放器效果图如图所示：
+该应用程序整体机构设计如图所示如图所示：
+
+视频播放模块   -- 播放显示模块   --播放控制器模块
+视频信息获取模块
+ui界面模块 --直播显示组件  --日期显示组件  --回看节目显示组件
+
+
+共分为三大模块，分别为视频播放模块、视频信息获取模块以及ui界面模块。其中，视频播放模块包括播放显示模块和播放控制器模块，播放显示模块负责将视频从网络上获取下来进行解码并显示在屏幕上。播放控制模块则负责显示当前视频节目的播放进度并控制其跳转与快进快退。视频信息获取模块负责从管理服务器提供的数据接口中提取相应的视频信息，传送给ui界面模块。ui界面模块负责显示节目信息以及控制视频节目的播放。
+
+
+### 4.4.2 功能模块实现
+--------------------
+1. 视频播放模块
+安卓客户端中的视频播放使用VideoView实现，内部封装MediaPlayer进行视频的播放的控制。MediaPlayer的状态转换图如图所示。
+
+
+![mediaplayer](src/mediaplayer.gif =x600)
+
+这张状态转换图清晰的描述了MediaPlayer的各个状态，也列举了主要的方法的调用时序，每种方法只能在一些特定的状态下使用，如果使用时MediaPlayer的状态不正确则会引发IllegalStateException异常。
+ 
+Idle 状态：当使用new()方法创建一个MediaPlayer对象或者调用了其reset()方法时，该MediaPlayer对象处于idle状态。这两种方法的一个重要差别就是：如果在这个状态下调用了getDuration()等方法（相当于调用时机不正确），通过reset()方法进入idle状态的话会触发OnErrorListener.onError()，并且MediaPlayer会进入Error状态；如果是新创建的MediaPlayer对象，则并不会触发onError(),也不会进入Error状态。
+ 
+End 状态：通过release()方法可以进入End状态，只要MediaPlayer对象不再被使用，就应当尽快将其通过release()方法释放掉，以释放相关的软硬件组件资源，这其中有些资源是只有一份的（相当于临界资源）。如果MediaPlayer对象进入了End状态，则不会在进入任何其他状态了。
+ 
+Initialized 状态：这个状态比较简单，MediaPlayer调用setDataSource()方法就进入Initialized状态，表示此时要播放的文件已经设置好了。
+ 
+Prepared 状态：初始化完成之后还需要通过调用prepare()或prepareAsync()方法，这两个方法一个是同步的一个是异步的，只有进入Prepared状态，才表明MediaPlayer到目前为止都没有错误，可以进行文件播放。
+ 
+Preparing 状态：这个状态比较好理解，主要是和prepareAsync()配合，如果异步准备完成，会触发OnPreparedListener.onPrepared()，进而进入Prepared状态。
+ 
+Started 状态：显然，MediaPlayer一旦准备好，就可以调用start()方法，这样MediaPlayer就处于Started状态，这表明MediaPlayer正在播放文件过程中。可以使用isPlaying()测试MediaPlayer是否处于了Started状态。如果播放完毕，而又设置了循环播放，则MediaPlayer仍然会处于Started状态，类似的，如果在该状态下MediaPlayer调用了seekTo()或者start()方法均可以让MediaPlayer停留在Started状态。
+ 
+Paused 状态：Started状态下MediaPlayer调用pause()方法可以暂停MediaPlayer，从而进入Paused状态，MediaPlayer暂停后再次调用start()则可以继续MediaPlayer的播放，转到Started状态，暂停状态时可以调用seekTo()方法，这是不会改变状态的。
+ 
+Stop 状态：Started或者Paused状态下均可调用stop()停止MediaPlayer，而处于Stop状态的MediaPlayer要想重新播放，需要通过prepareAsync()和prepare()回到先前的Prepared状态重新开始才可以。
+ 
+PlaybackCompleted状态：文件正常播放完毕，而又没有设置循环播放的话就进入该状态，并会触发OnCompletionListener的onCompletion()方法。此时可以调用start()方法重新从头播放文件，也可以stop()停止MediaPlayer，或者也可以seekTo()来重新定位播放位置。
+ 
+Error状态：如果由于某种原因MediaPlayer出现了错误，会触发OnErrorListener.onError()事件，此时MediaPlayer即进入Error状态，及时捕捉并妥善处理这些错误是很重要的，可以帮助我们及时释放相关的软硬件资源，也可以改善用户体验。通过setOnErrorListener(android.media.MediaPlayer.OnErrorListener)可以设置该监听器。如果MediaPlayer进入了Error状态，可以通过调用reset()来恢复，使得MediaPlayer重新返回到Idle状态。
+
+
+MediaPlayer底层调用开源视频编解码软件ffmpeg进行视频解码。ffmpeg视频解码过程分为网络数据读取与视音频解码与播放两个步骤。首先，创建一个数据读取线程，函数如下所示：
+
+		static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputFormat *iformat)
+		{
+        	frame_queue_init(&is->pictq, &is->videoq, ffp->pictq_size, 1)
+        	frame_queue_init(&is->sampq, &is->audioq, SAMPLE_QUEUE_SIZE, 1)
+        	packet_queue_init(&is->videoq);
+        	packet_queue_init(&is->audioq);
+        	SDL_CreateThreadEx(&is->_video_refresh_tid, video_refresh_thread, ffp, 	"ff_vout") //视频显示线程创建
+        	SDL_CreateThreadEx(&is->_read_tid, read_thread, ffp, "ff_read")
+		}
+		
+前面几句都是初始化队列的操作，分为初始化一个音频队列和一个视频队列，读取线程将获取到的音频帧和视频帧分别压倒队列中以便进行解码与播放。
+
+后面创建了两个线程，video_refresh_thread为视音频同步显示线程，read_thread则为数据读取线程。读取线程部分代码如下：
+
+	static int read_thread(void *arg)
+	{
+
+	
+   		err = avformat_open_input(&ic, is->filename, is->iformat, &ffp->format_opts);
+    	err = avformat_find_stream_info(ic, opts);
+	
+   		/* open the streams */
+    	if (st_index[AVMEDIA_TYPE_AUDIO] >= 0) {
+        	stream_component_open(ffp, st_index[AVMEDIA_TYPE_AUDIO]);
+    	}
+
+    	ret = -1;
+    	if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
+        	ret = stream_component_open(ffp, st_index[AVMEDIA_TYPE_VIDEO]);
+    	}
+		
+ 		for (;;) {
+    	if (is->seek_req) {
+           avformat_seek_file();
+       	} 
+    	ret = av_read_frame(ic, pkt);
+    	packet_queue_put(&is->audioq, pkt); 
+     	//如果是视频的话 
+    	//packet_queue_put(&is->videoq, pkt);  
+    	}
+	}
+	
+首先如果让我们来实现一个读取线程，我们是不是要先判断视频源的格式？？没错，avformat_open_input（）/Utils.c这句话内部就是探测数据源的格式。这里会跳转到ffmpeg里面了，不在本文讲解的范围内，有兴趣的童鞋可以自行阅读下源码，其实在avformat_open_input（）/Utils.c内读取网络数据包头信息时调用id3v2_parse()，然后获取到头信息后会执行ff_id3v2_parse_apic()/id3v2.c。最后 会更改ic这个AVFormatContext型的参数。
+
+avformat_find_stream_info()解析流并找到相应解码器。当然解码器在我们上一文初始化的时候注册过了，在哪里呢？
+
+在JNI_Load()函数里面有一个ijkmp_global_init()，然后它会调用avcodec_register_all();这个函数其实就是注册解码器等。
+
+然后对于音频或者视频都会调用stream_component_open()函数来进行音视频读取和解码。在stream_component_open函数中，分别创建视频和音频的解码线程video_thread与audio_thread。在video_thread与audio_thread，分别调用decoder_decode_frame进行视音频的解码。解码后放入相应的队列中，由jni调用上层java函数进行播放。
+
+
+
+2. 视频信息获取模块
+该模块使用异步任务AsyncTask实现。当一个程序第一次启动时，Android会同时启动一个对应的主线程（Main Thread），主线程主要负责处理与UI相关的事件，如：用户的按键事件，用户接触屏幕的事件以及屏幕绘图事件，并把相关的事件分发到对应的组件进行处理。所以主线程通常又被叫做UI线程。在开发Android应用时必须遵守单线程模型的原则： Android UI操作并不是线程安全的并且这些操作必须在UI线程中执行。如果在非UI线程中直接操作UI线程，会抛出异常。这与普通的Java程序不同。由于UI线程负责事件的监听和绘图，因此，必须保证UI线程能够随时响应用户的需求，UI线程里的操作应该向中断事件那样短小，费时的操作（如网络连接）需要另开线程，否则，如果UI线程超过5s没有响应用户请求，会弹出对话框提醒用户终止应用程序。
+为了不再主线程中执行耗时的信息获取操作，我们使用安卓提供的AsyncTask异步任务异步地获取信息，程序结束之后再讲结果返回给主线程。
+
+视频信息获取流程大致如下：
+
+	private class FetchInfoTask extends AsyncTask<Void,Void,Void> {
+
+        @Override
+        protected Void doInBackground( Void... params) {
+
+            if(mProvider.FetchChannels(getContext())){
+
+
+                while(!isLoaded){
+
+                }
+
+                isDownloaded = true;
+
+                mChannelAdapter.ChangeList(mProvider.mChannels);
+                if(mProvider.mChannels.size()>0)
+               
+                mProvider.FetchVideos();
+
+            }
+
+
+
+            return null;
+
+        }
+
+    }
+    
+在AsyncTask中的doInBackground方法中，执行信息获取的操作，首先，执行FetchChannels方法得到所有直播频道的信息。如果执行成功，则执行FetchVideos方法，遍历所有频道，获取每个频道最近7天的视频回看信息，并存储在本地。
+
+
+3. ui显示模块
+ui显示模块主要负责显示直播频道与回看节目的列表信息。程序中使用RecyclerView显示相应的列表信息。RecyclerView是Android L版本中新添加的一个用来取代ListView的SDK,它的灵活性与可替代性比ListView更好。ListView的基本结构徐图所示:
+
+![recyclerview](src/recyclerview.png =x100)
+
+对于ListView来说，通过创建ViewHolder来提升性能并不是必须的。因为ListView并没有严格的ViewHolder设计模式。但是在使用RecyclerView的时候，Adapter必须实现至少一个ViewHolder，必须遵循ViewHolder设计模式。ListView只能实现垂直线性排列的列表视图，与之不同的是，RecyclerView可以通过设置RecyclerView.LayoutManager来定制不同风格的视图，比如水平滚动列表或者不规则的瀑布流列表。在ListView中针对不同数据封装了各种类型的Adapter，比如用来处理数组的ArrayAdapter和用来展示Database结果的CursorAdapter; 在RecyclerView中必须自定义实现RecyclerView.Adapter并为其提供数据集合。
+
+
+
+
+
 
 # 5 系统测试与分析
---------------------------------
+----------------
+## 5.1 系统功能功能测试
+--------------------系统测试的目标是以最少的时间和人力找出软件中潜在的各种错误和缺陷。如对系统 实施了严格的规范测试,就能够发现其中大部分的错误。系统测试能够确认系统实现的功 能和性能与需求说明的一致性。系统测试还能收集到足够的测试结果为系统可靠性提供依据。目前测试仍然是保证系统质量的关键步骤,它是对系统需求规格、设计和编码最后的 验证、复审。系统测试集中反映了人们心理上、技术上、经济上对系统的认识,这种认识在 很大程度上又影响了系统的设计。本系统我们进行了长期的测试,邀请多人次、多时段对本系统进行测试,虽然在其中 发现了一些系统漏洞,但均通过重新修改源程序将其弥补。近一步的系统测试将在今后的 用户使用阶段来完成。
+
+### 5.1.1 服务器系统功能测试
+-----------------------------
+1. 服务器硬件平台
+测试使用硬件平台：
+
+2. 服务器软件平台
 
 
+### 5.1.2 客户端播放器系统功能测试
+-------------------------------
 
-#6
-------------------------
+
+## 5.2 服务器压力测试-------------------
+500
+
+
+#6 总结与展望
+------------
+
+500
 
 
 
